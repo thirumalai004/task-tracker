@@ -3,11 +3,14 @@
 A tiny Flask REST API that stores tasks in PostgreSQL.
 All settings come from environment variables, nothing is hard-coded.
 """
+import json
 import os
+import queue
 import sys
+import threading
 import time
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 
 
 class ConfigError(Exception):
@@ -41,6 +44,53 @@ def load_config(env=None):
         "db_user": env.get("DB_USER", "postgres"),
         "db_password": password,
     }
+
+
+class EventBroker:
+    """Pushes events to every connected browser (publish / subscribe).
+
+    Each browser that opens /events gets its own queue. publish() puts the
+    event in every queue, and the browser receives it immediately.
+    This lives in memory inside ONE process, which is why gunicorn runs with
+    one worker (and many threads).
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._listeners = []
+
+    def subscribe(self):
+        q = queue.Queue(maxsize=100)
+        with self._lock:
+            self._listeners.append(q)
+            count = len(self._listeners)
+        self.publish("viewers", {"count": count})
+        return q
+
+    def unsubscribe(self, q):
+        with self._lock:
+            if q in self._listeners:
+                self._listeners.remove(q)
+            count = len(self._listeners)
+        self.publish("viewers", {"count": count})
+
+    def publish(self, event, data):
+        with self._lock:
+            listeners = list(self._listeners)
+        for q in listeners:
+            try:
+                q.put_nowait((event, data))
+            except queue.Full:
+                pass  # a stuck browser must not block everyone else
+
+    def count(self):
+        with self._lock:
+            return len(self._listeners)
+
+
+def format_sse(event, data):
+    """Server-Sent Events wire format: 'event: name', 'data: json', blank line."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
 class PostgresStore:
@@ -125,6 +175,12 @@ class PostgresStore:
         )
         return self._as_dict(row) if row else None
 
+    def delete(self, task_id):
+        row = self._query(
+            "DELETE FROM tasks WHERE id = %s RETURNING id", (task_id,), fetch="one"
+        )
+        return row is not None
+
     def ping(self):
         try:
             self._query("SELECT 1", fetch="one")
@@ -133,13 +189,14 @@ class PostgresStore:
             return False
 
 
-def create_app(store=None, config=None):
+def create_app(store=None, config=None, broker=None):
     """Build the Flask app. Tests pass in a fake store; production uses Postgres."""
     if config is None:
         config = {"app_env": "test"} if store is not None else load_config()
     if store is None:
         store = PostgresStore(config)
 
+    broker = broker or EventBroker()
     app = Flask(__name__)
 
     @app.get("/health")
@@ -157,7 +214,9 @@ def create_app(store=None, config=None):
         title = title.strip()
         if len(title) > 200:
             return jsonify(error="title must be 200 characters or fewer"), 400
-        return jsonify(store.add(title)), 201
+        task = store.add(title)
+        broker.publish("task_added", task)
+        return jsonify(task), 201
 
     @app.get("/tasks")
     def list_tasks():
@@ -169,7 +228,40 @@ def create_app(store=None, config=None):
         task = store.mark_done(task_id)
         if task is None:
             return jsonify(error=f"task {task_id} not found"), 404
+        broker.publish("task_done", task)
         return jsonify(task)
+
+    @app.delete("/tasks/<int:task_id>")
+    def remove_task(task_id):
+        if not store.delete(task_id):
+            return jsonify(error=f"task {task_id} not found"), 404
+        broker.publish("task_deleted", {"id": task_id})
+        return jsonify(deleted=task_id)
+
+    @app.get("/")
+    def index():
+        return app.send_static_file("index.html")
+
+    @app.get("/events")
+    def events():
+        def stream():
+            q = broker.subscribe()
+            try:
+                yield ": connected\n\n"
+                while True:
+                    try:
+                        event, data = q.get(timeout=15)
+                        yield format_sse(event, data)
+                    except queue.Empty:
+                        yield ": keep-alive\n\n"  # stops proxies closing the idle connection
+            finally:
+                broker.unsubscribe(q)  # runs when the browser disconnects
+
+        return Response(
+            stream(),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.errorhandler(404)
     def not_found(_err):

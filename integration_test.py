@@ -46,6 +46,24 @@ def main():
     res = client.get("/tasks")
     check(res.get_json()["tasks"][0]["done"] is True, "done state was saved in the database")
 
+    # live updates: a connected browser must receive an event when a task is added
+    stream = client.get("/events", buffered=False)
+    chunks = iter(stream.response)
+    check(b"connected" in next(chunks), "GET /events opens a live stream")
+    client.post("/tasks", json={"title": "Seen live"})
+    seen = b""
+    for _ in range(5):
+        seen += next(chunks)
+        if b"task_added" in seen:
+            break
+    check(b"task_added" in seen and b"Seen live" in seen, "new task is pushed to the live stream")
+    stream.close()
+
+    res = client.get("/tasks")
+    extra = [t for t in res.get_json()["tasks"] if t["title"] == "Seen live"][0]
+    check(client.delete(f"/tasks/{extra['id']}").status_code == 200, "DELETE /tasks/<id> works")
+    check(client.delete(f"/tasks/{extra['id']}").status_code == 404, "deleting twice returns 404")
+
     check(client.put("/tasks/999999/done").status_code == 404, "unknown task returns 404")
     check(client.post("/tasks", json={"title": ""}).status_code == 400, "empty title returns 400")
 
