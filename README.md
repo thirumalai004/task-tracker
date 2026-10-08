@@ -1,6 +1,7 @@
 # Task Tracker: Jenkins + Docker pipeline project
 
-A small REST API (Flask) that stores tasks in PostgreSQL. Jenkins builds it,
+A small real-time web app (Flask + PostgreSQL). Open it in two browser tabs and
+watch changes appear in both instantly. Jenkins builds it,
 tests it against a throwaway database, tags it with the build number, deploys
 it as `dev` or `prod`, health-checks it, and rolls back if the new version is unhealthy.
 
@@ -8,7 +9,8 @@ it as `dev` or `prod`, health-checks it, and rolls back if the new version is un
 
 ```
 task-tracker/
-├── app.py                # Flask API + PostgreSQL store, config from env vars
+├── app.py                # Flask API, live-update broker (SSE), PostgreSQL store, env-var config
+├── static/index.html     # the web page (live list, no refresh needed)
 ├── test_app.py           # unit tests (fake store, no database)
 ├── integration_test.py   # runs the real app against a real Postgres
 ├── requirements.txt
@@ -23,10 +25,13 @@ task-tracker/
 
 | Method | Path | Result |
 |---|---|---|
+| GET | `/` | the web page |
+| GET | `/events` | live stream (Server-Sent Events): `task_added`, `task_done`, `task_deleted`, `viewers` |
 | GET | `/health` | `200 {"status":"ok"}`, or `503` if the database is unreachable |
 | POST | `/tasks` | body `{"title":"Buy milk"}` -> `201` with the task; `400` if the title is empty or over 200 chars |
 | GET | `/tasks` | `{"tasks":[...],"count":N}` |
 | PUT | `/tasks/<id>/done` | the updated task, or `404` |
+| DELETE | `/tasks/<id>` | `{"deleted": id}`, or `404` |
 
 ## Configuration (environment variables only)
 
@@ -60,6 +65,19 @@ curl.exe http://localhost:3301/health
    Check with a job that runs `docker ps`.
 2. New Item -> Pipeline -> `task-tracker` -> Pipeline script from SCM -> Git -> your repo, branch `*/main`, Script Path `Jenkinsfile`.
 3. Build Now once (registers the parameters), then Build with Parameters.
+
+## How the live updates work
+
+1. The page opens `/events` with `EventSource`. The connection stays open.
+2. Each open connection gets its own queue inside the app (`EventBroker`).
+3. When anyone adds, completes or deletes a task, the app publishes an event to every queue
+   and each browser receives it immediately.
+4. If the connection drops (for example during a redeploy), the browser reconnects by itself
+   and reloads the list, so nothing is missed.
+
+Limits: the broker lives in one process's memory, so gunicorn runs one worker with 32 threads
+(each open tab uses one thread). To run several app containers, replace the broker with
+Redis pub/sub or PostgreSQL LISTEN/NOTIFY.
 
 ## Notes
 
