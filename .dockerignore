@@ -1,0 +1,9 @@
+.git
+.gitignore
+.gitattributes
+__pycache__/
+*.pyc
+Jenkinsfile
+deploy.sh
+README.md
+*.zip
