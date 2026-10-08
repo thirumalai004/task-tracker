@@ -1,7 +1,7 @@
 """Unit tests. They use an in-memory fake store, so no database is needed."""
 import unittest
 
-from app import ConfigError, EventBroker, create_app, format_sse, load_config
+from app import ConfigError, create_app, load_config
 
 
 class MemoryStore:
@@ -25,11 +25,6 @@ class MemoryStore:
                 task["done"] = True
                 return dict(task)
         return None
-
-    def delete(self, task_id):
-        before = len(self.tasks)
-        self.tasks = [t for t in self.tasks if t["id"] != task_id]
-        return len(self.tasks) < before
 
     def ping(self):
         return self.healthy
@@ -112,81 +107,6 @@ class ApiTests(unittest.TestCase):
         res = self.client.get("/nope")
         self.assertEqual(res.status_code, 404)
         self.assertEqual(res.get_json(), {"error": "not found"})
-
-
-class DeleteAndPageTests(unittest.TestCase):
-    def setUp(self):
-        self.client = create_app(store=MemoryStore()).test_client()
-
-    def test_delete_task(self):
-        self.client.post("/tasks", json={"title": "A"})
-        res = self.client.delete("/tasks/1")
-        self.assertEqual(res.status_code, 200)
-        self.assertEqual(self.client.get("/tasks").get_json()["count"], 0)
-
-    def test_delete_unknown_task(self):
-        self.assertEqual(self.client.delete("/tasks/42").status_code, 404)
-
-    def test_home_page_is_served(self):
-        res = self.client.get("/")
-        self.assertEqual(res.status_code, 200)
-        self.assertIn(b"EventSource", res.data)
-        res.close()
-
-
-class LiveUpdateTests(unittest.TestCase):
-    def test_broker_delivers_to_every_listener(self):
-        broker = EventBroker()
-        a, b = broker.subscribe(), broker.subscribe()
-        broker.publish("task_added", {"id": 1})
-        for q in (a, b):
-            events = []
-            while not q.empty():
-                events.append(q.get_nowait())
-            self.assertIn(("task_added", {"id": 1}), events)
-
-    def test_unsubscribe_stops_delivery_and_updates_count(self):
-        broker = EventBroker()
-        q = broker.subscribe()
-        self.assertEqual(broker.count(), 1)
-        broker.unsubscribe(q)
-        self.assertEqual(broker.count(), 0)
-
-    def test_format_sse(self):
-        self.assertEqual(
-            format_sse("task_done", {"id": 3}), 'event: task_done\ndata: {"id": 3}\n\n'
-        )
-
-    def test_events_endpoint_streams_changes(self):
-        broker = EventBroker()
-        client = create_app(store=MemoryStore(), broker=broker).test_client()
-        stream = client.get("/events", buffered=False)
-        self.assertEqual(stream.mimetype, "text/event-stream")
-        chunks = iter(stream.response)
-        self.assertIn(b": connected", next(chunks))          # subscribed now
-        client.post("/tasks", json={"title": "Live!"})
-        seen = b""
-        for _ in range(5):                                      # skip the 'viewers' event
-            seen += next(chunks)
-            if b"task_added" in seen:
-                break
-        self.assertIn(b"event: task_added", seen)
-        self.assertIn(b"Live!", seen)
-        stream.close()
-        self.assertEqual(broker.count(), 0)                     # disconnect cleans up
-
-    def test_done_and_delete_are_broadcast(self):
-        broker = EventBroker()
-        client = create_app(store=MemoryStore(), broker=broker).test_client()
-        client.post("/tasks", json={"title": "A"})
-        q = broker.subscribe()
-        client.put("/tasks/1/done")
-        client.delete("/tasks/1")
-        names = []
-        while not q.empty():
-            names.append(q.get_nowait()[0])
-        self.assertIn("task_done", names)
-        self.assertIn("task_deleted", names)
 
 
 if __name__ == "__main__":

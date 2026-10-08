@@ -21,14 +21,11 @@ pipeline {
         stage('Checkout') {
             steps {
                 // Fail fast: check the parameters before doing any Docker work.
-                // (A password parameter is a Secret object in Groovy, so the check
-                // is done in the shell, where DB_PASSWORD is a plain variable.)
-                sh '''
-                    if [ -z "$DB_PASSWORD" ]; then
-                        echo "DB_PASSWORD must not be empty"
-                        exit 1
-                    fi
-                '''
+                script {
+                    if (!params.DB_PASSWORD?.trim()) {
+                        error 'DB_PASSWORD must not be empty'
+                    }
+                }
                 checkout scm
                 sh 'docker version --format "Docker server {{.Server.Version}}"'
             }
